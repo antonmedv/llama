@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	. "strings"
 	"time"
 
@@ -90,8 +91,10 @@ type model struct {
 	offset         int                       // Scroll position.
 	styles         map[string]lipgloss.Style // Colors of different files based on git status.
 	editMode       bool                      // User opened file for editing.
+	vimMode        bool                      // enable vim key bindings.
 	positions      map[string]position       // Map of cursor positions per path.
 	search         string                    // Search file by this name.
+	searchMode     bool                      // fuzzy search with "/".
 	updatedAt      time.Time                 // Time of last key press.
 	matchedIndexes []int                     // List of char found indexes.
 	prevName       string                    // Base name of previous directory before "up".
@@ -128,7 +131,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
-		if msg.Type == tea.KeyRunes {
+		m.vimMode, _ = strconv.ParseBool(lookup([]string{"LLAMA_VIM_KEYBINDINGS"}, "false"))
+
+		if msg.Type == tea.KeyRunes && m.searchMode {
 			// Input a regular character, do the search.
 			if time.Now().Sub(m.updatedAt).Seconds() >= 1 {
 				m.search = string(msg.Runes)
@@ -147,105 +152,120 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.c = index / m.rows
 				m.r = index % m.rows
 			}
-		}
+		} else {
+			navKeys := []string{"up", "down", "left", "right"}
+			if m.vimMode {
+				navKeys = []string{"k", "j", "h", "l"}
+			}
 
-		switch keypress := msg.String(); keypress {
-		case "ctrl+c":
-			_, _ = fmt.Fprintln(os.Stderr) // Keep last item visible after prompt.
-			m.exitCode = 2
-			return m, tea.Quit
+			switch keypress := msg.String(); keypress {
+			case "/":
+				if m.vimMode {
+					m.searchMode = true
+				}
 
-		case "esc":
-			_, _ = fmt.Fprintln(os.Stderr) // Keep last item visible after prompt.
-			fmt.Println(m.path)            // Write to cd.
-			m.exitCode = 0
-			return m, tea.Quit
+			case "ctrl+c":
+				_, _ = fmt.Fprintln(os.Stderr) // Keep last item visible after prompt.
+				m.exitCode = 2
+				return m, tea.Quit
 
-		case "enter":
-			newPath := filepath.Join(m.path, m.cursorFileName())
-			if fi := fileInfo(newPath); fi.IsDir() {
-				// Enter subdirectory.
-				m.path = newPath
+			case "esc":
+				if m.searchMode && m.vimMode {
+					m.searchMode = false
+				} else {
+					_, _ = fmt.Fprintln(os.Stderr) // Keep last item visible after prompt.
+					fmt.Println(m.path)            // Write to cd.
+					m.exitCode = 0
+					return m, tea.Quit
+				}
+
+			case "enter":
+				m.searchMode = false
+				newPath := filepath.Join(m.path, m.cursorFileName())
+				if fi := fileInfo(newPath); fi.IsDir() {
+					// Enter subdirectory.
+					m.path = newPath
+					if p, ok := m.positions[m.path]; ok {
+						m.c = p.c
+						m.r = p.r
+						m.offset = p.offset
+					} else {
+						m.c = 0
+						m.r = 0
+						m.offset = 0
+					}
+					m.list()
+					m.status()
+				} else {
+					// Open file.
+					cmd := exec.Command(lookup([]string{"LLAMA_EDITOR", "EDITOR"}, "less"), filepath.Join(m.path, m.cursorFileName()))
+					cmd.Stdin = os.Stdin
+					cmd.Stdout = os.Stderr // Render to stderr.
+					m.editMode = true
+					_ = cmd.Run()
+					m.editMode = false
+					return m, tea.HideCursor
+				}
+
+			case "backspace":
+				m.prevName = filepath.Base(m.path)
+				m.path = filepath.Join(m.path, "..")
 				if p, ok := m.positions[m.path]; ok {
 					m.c = p.c
 					m.r = p.r
 					m.offset = p.offset
 				} else {
-					m.c = 0
-					m.r = 0
-					m.offset = 0
+					m.findPrevName = true
+					m.list()
+					m.status()
 				}
 				m.list()
 				m.status()
-			} else {
-				// Open file.
-				cmd := exec.Command(lookup([]string{"LLAMA_EDITOR", "EDITOR"}, "less"), filepath.Join(m.path, m.cursorFileName()))
-				cmd.Stdin = os.Stdin
-				cmd.Stdout = os.Stderr // Render to stderr.
-				m.editMode = true
-				_ = cmd.Run()
-				m.editMode = false
-				return m, tea.HideCursor
-			}
 
-		case "backspace":
-			m.prevName = filepath.Base(m.path)
-			m.path = filepath.Join(m.path, "..")
-			if p, ok := m.positions[m.path]; ok {
-				m.c = p.c
-				m.r = p.r
-				m.offset = p.offset
-			} else {
-				m.findPrevName = true
-				m.list()
-				m.status()
-			}
-			m.list()
-			m.status()
+			case navKeys[0]:
+				m.r--
+				if m.r < 0 {
+					m.r = m.rows - 1
+					m.c--
+				}
+				if m.c < 0 {
+					m.r = m.rows - 1 - (m.columns*m.rows - len(m.files))
+					m.c = m.columns - 1
+				}
 
-		case "up":
-			m.r--
-			if m.r < 0 {
-				m.r = m.rows - 1
+			case navKeys[1]:
+				m.r++
+				if m.r >= m.rows {
+					m.r = 0
+					m.c++
+				}
+				if m.c >= m.columns {
+					m.c = 0
+				}
+				if m.c == m.columns-1 && (m.columns-1)*m.rows+m.r >= len(m.files) {
+					m.r = 0
+					m.c = 0
+				}
+
+			case navKeys[2]:
 				m.c--
-			}
-			if m.c < 0 {
-				m.r = m.rows - 1 - (m.columns*m.rows - len(m.files))
-				m.c = m.columns - 1
-			}
+				if m.c < 0 {
+					m.c = m.columns - 1
+				}
+				if m.c == m.columns-1 && (m.columns-1)*m.rows+m.r >= len(m.files) {
+					m.r = m.rows - 1 - (m.columns*m.rows - len(m.files))
+					m.c = m.columns - 1
+				}
 
-		case "down":
-			m.r++
-			if m.r >= m.rows {
-				m.r = 0
+			case navKeys[3]:
 				m.c++
-			}
-			if m.c >= m.columns {
-				m.c = 0
-			}
-			if m.c == m.columns-1 && (m.columns-1)*m.rows+m.r >= len(m.files) {
-				m.r = 0
-				m.c = 0
-			}
-
-		case "left":
-			m.c--
-			if m.c < 0 {
-				m.c = m.columns - 1
-			}
-			if m.c == m.columns-1 && (m.columns-1)*m.rows+m.r >= len(m.files) {
-				m.r = m.rows - 1 - (m.columns*m.rows - len(m.files))
-				m.c = m.columns - 1
-			}
-
-		case "right":
-			m.c++
-			if m.c >= m.columns {
-				m.c = 0
-			}
-			if m.c == m.columns-1 && (m.columns-1)*m.rows+m.r >= len(m.files) {
-				m.r = m.rows - 1 - (m.columns*m.rows - len(m.files))
-				m.c = m.columns - 1
+				if m.c >= m.columns {
+					m.c = 0
+				}
+				if m.c == m.columns-1 && (m.columns-1)*m.rows+m.r >= len(m.files) {
+					m.r = m.rows - 1 - (m.columns*m.rows - len(m.files))
+					m.c = m.columns - 1
+				}
 			}
 		}
 	}
